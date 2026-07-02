@@ -12,8 +12,13 @@ import urllib
 import subprocess
 import datetime
 import pytz
+import threading
+import asyncio
+import io
 from base64 import b64encode, b64decode
 from subprocess import getstatusoutput
+from typing import Optional, Dict, List, Union
+from pathlib import Path
 
 # 📦 Third-party Libraries
 import aiohttp
@@ -25,6 +30,7 @@ import m3u8
 import cloudscraper
 import yt_dlp
 import tgcrypto
+import schedule
 from logs import logging
 from bs4 import BeautifulSoup
 from pytube import YouTube
@@ -58,7 +64,6 @@ import auth
 import thanos as helper
 from html_handler import html_handler
 from thanos import *
-
 from clean import register_clean_handler
 from logs import logging
 from utils import progress_bar
@@ -66,11 +71,34 @@ from vars import *
 from pyromod import listen
 from db import db
 
+# ===================== LOG CHANNEL CONFIG =====================
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", str(OWNER_ID)))
+
+# ===================== AUTO-UPLOADER CONFIGURATION =====================
+
+AUTO_UPLOAD_ENABLED = os.getenv("AUTO_UPLOAD_ENABLED", "true").lower() == "true"
+AUTO_UPLOAD_TIME = os.getenv("AUTO_UPLOAD_TIME", "09:00")
+AUTO_UPLOAD_CHANNEL = int(os.getenv("AUTO_UPLOAD_CHANNEL", "-1003692273087"))
+AUTO_UPLOAD_BATCH_IDS = os.getenv("AUTO_UPLOAD_BATCH_IDS", "").split(",")
+AUTO_UPLOAD_INTERVAL_HOURS = int(os.getenv("AUTO_UPLOAD_INTERVAL_HOURS", "24"))
+AUTO_UPLOAD_HISTORY_FILE = os.getenv("AUTO_UPLOAD_HISTORY_FILE", "upload_history.json")
+
+# ===================== AUTO-UPLOADER API CONFIG =====================
+
+API_BASE = os.getenv("API_BASE", "https://backend.multistreaming.site/api")
+CW_ALL_BATCHES = os.getenv("CW_ALL_BATCHES", "https://cw-ut-apis-e37c22944d2f.herokuapp.com/api/batches")
+CW_BATCH_API = os.getenv("CW_BATCH_API", "https://cw-api-website.vercel.app/batch/{}")
+CW_TOPIC_API = os.getenv("CW_TOPIC_API", "https://cw-api-website.vercel.app/batch?batchid={}&topicid={}")
+CW_VIDEO_API = os.getenv("CW_VIDEO_API", "https://cw-vid-virid.vercel.app/get_video_details?name={}")
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Content-Type": "application/json",
+    "Accept": "application/json"
+}
+
 # Set IST timezone
 IST = pytz.timezone('Asia/Kolkata')
-
-auto_flags = {}
-auto_clicked = False
 
 # Global variables
 watermark = "/d"
@@ -109,10 +137,398 @@ bot = Client(
     in_memory=True
 )
 
-# Register clean handler
-register_clean_handler(bot)
+# ===================== AUTO-UPLOADER CLASS =====================
 
-# ========================= SETTINGS SYSTEM =========================
+class AutoUploadManager:
+    def __init__(self):
+        self.is_running = False
+        self.last_upload_time = None
+        self.upload_history = self._load_history()
+        self.scheduler_thread = None
+        self.scheduler_running = False
+        self.bot = None
+        self._loop = None
+        
+    def _load_history(self):
+        """Load upload history from file"""
+        try:
+            if os.path.exists(AUTO_UPLOAD_HISTORY_FILE):
+                with open(AUTO_UPLOAD_HISTORY_FILE, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load upload history: {e}")
+        return []
+    
+    def _save_history(self):
+        """Save upload history to file"""
+        try:
+            with open(AUTO_UPLOAD_HISTORY_FILE, 'w') as f:
+                json.dump(self.upload_history, f, indent=2, default=str)
+        except Exception as e:
+            logging.error(f"Could not save upload history: {e}")
+    
+    async def _fetch_with_retry(self, session, url, retries=3, timeout=15):
+        """Fetch with retry logic"""
+        for attempt in range(retries):
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    logging.warning(f"Attempt {attempt+1}: {url} returned {resp.status}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logging.warning(f"Attempt {attempt+1} failed: {e}")
+            await asyncio.sleep(2)
+        return None
+    
+    async def extract_batch_content(self, batch_id: str, batch_name: str = None) -> tuple:
+        """Extract content from a specific batch"""
+        try:
+            logging.info(f"Extracting content for batch: {batch_id}")
+            
+            async with aiohttp.ClientSession(headers=HEADERS) as session:
+                # Try main API first
+                batch_data = await self._fetch_with_retry(session, f"{API_BASE}/courses/{batch_id}/classes?populate=full")
+                
+                if batch_data:
+                    topics = batch_data.get("data", {}).get("classes", [])
+                    if topics:
+                        batch_name = batch_data.get("data", {}).get("title") or batch_name or f"Batch_{batch_id}"
+                        output = []
+                        
+                        for t in topics:
+                            topic_name = t.get('topicName', 'General')
+                            for cls in t.get("classes", []):
+                                title = cls.get('title', 'Untitled').strip()
+                                v_link = cls.get('class_link')
+                                if v_link:
+                                    output.append(f"🎥 [{topic_name}] {title} (VIDEO) : {v_link}")
+                                for pdf in cls.get("classPdf", []):
+                                    p_url = pdf.get("url") if isinstance(pdf, dict) else str(pdf)
+                                    if p_url:
+                                        output.append(f"📄 [{topic_name}] {title} (PDF) : {p_url}")
+                        
+                        if output:
+                            return "\n".join(output), batch_name
+                
+                # Try CW API
+                topics_data = await self._fetch_with_retry(session, CW_BATCH_API.format(batch_id))
+                if topics_data:
+                    batch_details = topics_data.get('data', topics_data) if isinstance(topics_data, dict) else topics_data
+                    batch_name = batch_name or batch_details.get('batchName') or batch_details.get('name') or f"Batch_{batch_id}"
+                    topics = batch_details.get('topics', []) if isinstance(batch_details, dict) else batch_details
+                    
+                    if isinstance(topics, list) and topics:
+                        output = []
+                        for topic in topics:
+                            if not isinstance(topic, dict):
+                                continue
+                            topic_name = topic.get('topicName') or topic.get('name') or 'Unnamed Topic'
+                            topic_id = topic.get('topicId') or topic.get('id') or topic.get('_id')
+                            
+                            if not topic_id:
+                                continue
+                            
+                            content_url = CW_TOPIC_API.format(batch_id, topic_id)
+                            content_res = await self._fetch_with_retry(session, content_url, timeout=12)
+                            
+                            if content_res:
+                                inner_data = content_res.get('data', content_res) if isinstance(content_res, dict) else content_res
+                                raw_videos = inner_data.get('classes', []) or inner_data.get('videos', []) or inner_data.get('class', [])
+                                raw_pdfs = inner_data.get('notes', []) or inner_data.get('pdfs', []) or inner_data.get('batch-notes', [])
+                                
+                                if raw_videos:
+                                    for vid in raw_videos:
+                                        if isinstance(vid, dict):
+                                            vid_name = vid.get('title') or vid.get('videoName') or vid.get('name') or 'Video'
+                                            raw_token = vid.get('video_url') or vid.get('videoLink') or vid.get('url') or vid.get('link')
+                                            if raw_token:
+                                                output.append(f"🎥 [{topic_name}] {vid_name} : {str(raw_token)}")
+                                
+                                if raw_pdfs:
+                                    for pdf in raw_pdfs:
+                                        if isinstance(pdf, dict):
+                                            pdf_name = pdf.get('title') or pdf.get('pdfName') or pdf.get('name') or 'Document'
+                                            pdf_url = pdf.get('download_url') or pdf.get('view_url') or pdf.get('pdfLink')
+                                            if pdf_url:
+                                                output.append(f"📄 [{topic_name}] {pdf_name} : {pdf_url}")
+                        
+                        if output:
+                            return "\n".join(output), batch_name
+                
+                return None, "No content found in batch"
+                
+        except Exception as e:
+            logging.error(f"Error extracting batch {batch_id}: {e}")
+            return None, str(e)
+    
+    async def upload_batch_content(self, bot, batch_id: str, batch_name: str = None, target_channel: int = None) -> tuple:
+        """Extract and upload batch content to channel"""
+        try:
+            logging.info(f"Starting auto-upload for batch: {batch_id}")
+            
+            # Check if already uploaded today
+            today = datetime.datetime.now(IST).date().isoformat()
+            for record in self.upload_history:
+                if record.get('batch_id') == batch_id and record.get('date') == today:
+                    logging.info(f"Batch {batch_id} already uploaded today, skipping")
+                    return True, "Already uploaded today"
+            
+            content, error = await self.extract_batch_content(batch_id, batch_name)
+            
+            if error or content is None:
+                error_msg = f"❌ Auto-Upload Failed for batch {batch_id}: {error or 'No content found'}"
+                logging.error(error_msg)
+                return False, error_msg
+            
+            # Create file
+            timestamp = datetime.datetime.now(IST).strftime("%Y-%m-%d_%H-%M-%S")
+            filename = f"batch_{batch_id}_{timestamp}.txt"
+            
+            # Add metadata header
+            header = (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⚡ Auto-Uploaded Batch Content\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📅 Uploaded: {datetime.datetime.now(IST).strftime('%A, %d %B %Y %I:%M %p')}\n"
+                f"📛 Batch ID: {batch_id}\n"
+                f"📦 Total Items: {len(content.split(chr(10)))}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            )
+            
+            full_content = header + content
+            
+            file_buffer = io.BytesIO(full_content.encode('utf-8'))
+            file_buffer.name = filename
+            
+            channel = target_channel or AUTO_UPLOAD_CHANNEL
+            
+            # Send to channel
+            caption = (
+                f"✨ <b>AUTO-UPLOAD</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📛 <b>Batch ID:</b> {batch_id}\n"
+                f"📦 <b>Items:</b> {len(content.split(chr(10)))}\n"
+                f"📅 <b>Date:</b> {datetime.datetime.now(IST).strftime('%d-%m-%Y %I:%M %p')}\n"
+                f"⏰ <b>Schedule:</b> Daily Auto-Upload\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⚡ {CREDIT}"
+            )
+            
+            await bot.send_document(
+                chat_id=channel,
+                document=file_buffer,
+                filename=filename,
+                caption=caption,
+                parse_mode="HTML"
+            )
+            
+            # Record upload
+            self.last_upload_time = datetime.datetime.now(IST)
+            self.upload_history.append({
+                'batch_id': batch_id,
+                'date': today,
+                'timestamp': self.last_upload_time.isoformat(),
+                'filename': filename,
+                'items_count': len(content.split(chr(10)))
+            })
+            self._save_history()
+            
+            logging.info(f"✅ Auto-upload completed for batch: {batch_id}")
+            return True, f"Successfully uploaded batch {batch_id}"
+            
+        except Exception as e:
+            logging.error(f"Auto-upload error for batch {batch_id}: {e}")
+            return False, str(e)
+    
+    async def run_scheduled_upload(self):
+        """Run the scheduled upload for all configured batches"""
+        if not AUTO_UPLOAD_ENABLED:
+            logging.info("Auto-upload is disabled")
+            return
+        
+        if self.is_running:
+            logging.info("Auto-upload already running, skipping...")
+            return
+        
+        if self.bot is None:
+            logging.error("Bot not set for auto-uploader")
+            return
+        
+        self.is_running = True
+        try:
+            batch_ids = [bid.strip() for bid in AUTO_UPLOAD_BATCH_IDS if bid.strip()]
+            
+            if not batch_ids:
+                logging.warning("No batch IDs configured for auto-upload")
+                return
+            
+            results = []
+            success_count = 0
+            
+            for batch_id in batch_ids:
+                success, message = await self.upload_batch_content(self.bot, batch_id)
+                if success:
+                    success_count += 1
+                results.append(f"• Batch {batch_id}: {'✅' if success else '❌'} {message}")
+                await asyncio.sleep(2)
+            
+            # Send summary to log channel
+            summary = (
+                f"📊 <b>Auto-Upload Summary</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📅 {datetime.datetime.now(IST).strftime('%A, %d %B %Y')}\n"
+                f"⏰ {datetime.datetime.now(IST).strftime('%I:%M %p')}\n"
+                f"📊 Success: {success_count}/{len(batch_ids)}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                + "\n".join(results)
+            )
+            
+            try:
+                await self.bot.send_message(
+                    chat_id=LOG_CHANNEL_ID,
+                    text=summary,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logging.error(f"Failed to send summary: {e}")
+            
+        except Exception as e:
+            logging.error(f"Auto-upload failed: {e}")
+        finally:
+            self.is_running = False
+    
+    def _run_async_upload(self):
+        """Run async upload in event loop"""
+        try:
+            if self._loop is None:
+                self._loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self._loop)
+            
+            self._loop.run_until_complete(self.run_scheduled_upload())
+        except Exception as e:
+            logging.error(f"Async upload failed: {e}")
+    
+    def start_scheduler(self, bot):
+        """Start the scheduler in a separate thread"""
+        if self.scheduler_running:
+            return
+        
+        self.bot = bot
+        
+        def run_scheduler():
+            # Schedule daily upload
+            schedule.every().day.at(AUTO_UPLOAD_TIME).do(self._run_async_upload)
+            
+            # Also run every X hours if interval is less than 24
+            if AUTO_UPLOAD_INTERVAL_HOURS < 24:
+                schedule.every(AUTO_UPLOAD_INTERVAL_HOURS).hours.do(self._run_async_upload)
+            
+            self.scheduler_running = True
+            logging.info(f"🔄 Auto-upload scheduler started. Daily at {AUTO_UPLOAD_TIME}")
+            
+            while self.scheduler_running:
+                schedule.run_pending()
+                time.sleep(60)
+        
+        self.scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+        self.scheduler_thread.start()
+    
+    def stop_scheduler(self):
+        """Stop the scheduler"""
+        self.scheduler_running = False
+        if self.scheduler_thread:
+            self.scheduler_thread.join(timeout=5)
+        logging.info("Auto-upload scheduler stopped")
+
+# ===================== BOT COMMANDS =====================
+
+@bot.on_message(filters.command("autoupload") & filters.private)
+async def auto_upload_cmd(client: Client, message: Message):
+    """Manually trigger auto-upload"""
+    try:
+        if not db.is_admin(message.from_user.id):
+            await message.reply_text("⚠️ You are not authorized to use this command!")
+            return
+        
+        if not hasattr(bot, 'auto_upload_manager'):
+            await message.reply_text("❌ Auto-upload manager not initialized")
+            return
+        
+        manager = bot.auto_upload_manager
+        msg = await message.reply_text("⏳ Starting auto-upload manually...")
+        
+        await manager.run_scheduled_upload()
+        
+        await msg.edit_text(
+            f"✅ <b>Auto-upload completed!</b>\n\n"
+            f"📅 {datetime.datetime.now(IST).strftime('%A, %d %B %Y %I:%M %p')}\n"
+            f"📤 Check channel for uploaded files",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await message.reply_text(f"❌ Error: {str(e)}")
+
+@bot.on_message(filters.command("autouploadstatus") & filters.private)
+async def auto_upload_status_cmd(client: Client, message: Message):
+    """Check auto-upload status"""
+    try:
+        if not db.is_admin(message.from_user.id):
+            await message.reply_text("⚠️ You are not authorized to use this command!")
+            return
+        
+        if not hasattr(bot, 'auto_upload_manager'):
+            await message.reply_text("❌ Auto-upload manager not initialized")
+            return
+        
+        manager = bot.auto_upload_manager
+        
+        status_text = (
+            f"📊 <b>Auto-Upload Status</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚙️ <b>Enabled:</b> {'✅ Yes' if AUTO_UPLOAD_ENABLED else '❌ No'}\n"
+            f"⏰ <b>Schedule:</b> Daily at {AUTO_UPLOAD_TIME}\n"
+            f"📊 <b>Interval:</b> {AUTO_UPLOAD_INTERVAL_HOURS} hours\n"
+            f"📋 <b>Batch IDs:</b>\n"
+            f"{chr(10).join(['  • ' + bid for bid in AUTO_UPLOAD_BATCH_IDS if bid.strip()]) or '  None configured'}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📤 <b>Last Upload:</b> {manager.last_upload_time.strftime('%d-%m-%Y %I:%M %p') if manager.last_upload_time else 'Never'}\n"
+            f"📦 <b>Upload History:</b> {len(manager.upload_history)} batches\n"
+            f"🔄 <b>Currently Running:</b> {'✅ Yes' if manager.is_running else '❌ No'}"
+        )
+        
+        await message.reply_text(status_text, parse_mode="HTML")
+    except Exception as e:
+        await message.reply_text(f"❌ Error: {str(e)}")
+
+@bot.on_message(filters.command("autouploadconfig") & filters.private)
+async def auto_upload_config_cmd(client: Client, message: Message):
+    """Configure auto-upload settings"""
+    try:
+        if not db.is_admin(message.from_user.id):
+            await message.reply_text("⚠️ You are not authorized to use this command!")
+            return
+        
+        await message.reply_text(
+            f"⚙️ <b>Auto-Upload Configuration</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"To configure auto-upload, set these environment variables:\n\n"
+            f"• <code>AUTO_UPLOAD_ENABLED</code> = true/false\n"
+            f"• <code>AUTO_UPLOAD_TIME</code> = HH:MM (e.g., 09:00)\n"
+            f"• <code>AUTO_UPLOAD_CHANNEL</code> = Channel ID\n"
+            f"• <code>AUTO_UPLOAD_BATCH_IDS</code> = comma,separated,ids\n"
+            f"• <code>AUTO_UPLOAD_INTERVAL_HOURS</code> = 24\n\n"
+            f"<b>Current Status:</b>\n"
+            f"• Enabled: {AUTO_UPLOAD_ENABLED}\n"
+            f"• Time: {AUTO_UPLOAD_TIME}\n"
+            f"• Channel: {AUTO_UPLOAD_CHANNEL}\n"
+            f"• Batches: {', '.join([bid for bid in AUTO_UPLOAD_BATCH_IDS if bid.strip()]) or 'None'}\n"
+            f"• Interval: {AUTO_UPLOAD_INTERVAL_HOURS}h",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await message.reply_text(f"❌ Error: {str(e)}")
+
+# ===================== SETTINGS SYSTEM =====================
 
 def get_user_settings(user_id: int, bot_username: str = None) -> dict:
     if bot_username is None:
@@ -158,6 +574,8 @@ async def settings_cmd(client: Client, message: Message):
         "⚙️ **Settings Menu**\n\nChoose an option to modify:",
         reply_markup=settings_menu_markup(user_id)
     )
+
+# ===================== SETTINGS CALLBACK =====================
 
 @bot.on_callback_query()
 async def settings_callback(client: Client, query: CallbackQuery):
@@ -393,7 +811,7 @@ async def settings_callback(client: Client, query: CallbackQuery):
 
     await query.answer("Unknown option")
 
-# ========================= END SETTINGS SYSTEM =========================
+# ===================== BOT EVENTS =====================
 
 @bot.on_message(filters.command("setlog") & filters.private)
 async def set_log_channel_cmd(client: Client, message: Message):
@@ -427,909 +845,14 @@ async def get_log_channel_cmd(client: Client, message: Message):
     except Exception as e:
         await message.reply_text(f"❌ Error: {str(e)}")
 
-# Re-register auth commands
-bot.add_handler(MessageHandler(auth.add_user_cmd, filters.command("add") & filters.private))
-bot.add_handler(MessageHandler(auth.remove_user_cmd, filters.command("remove") & filters.private))
-bot.add_handler(MessageHandler(auth.list_users_cmd, filters.command("users") & filters.private))
-bot.add_handler(MessageHandler(auth.my_plan_cmd, filters.command("plan") & filters.private))
+# ===================== MAIN EXECUTION =====================
 
-cookies_file_path = os.getenv("cookies_file_path", "youtube_cookies.txt")
-api_url = "http://master-api-v3.vercel.app/"
-api_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiNzkxOTMzNDE5NSIsInRnX3VzZXJuYW1lIjoi4p61IFtvZmZsaW5lXSIsImlhdCI6MTczODY5MjA3N30.SXzZ1MZcvMp5sGESj0hBKSghhxJ3k1GTWoBUbivUe1I"
-cwtoken = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJpYXQiOjE3NTExOTcwNjQsImNvbiI6eyJpc0FkbWluIjpmYWxzZSwiYXVzZXIiOiJVMFZ6TkdGU2NuQlZjR3h5TkZwV09FYzBURGxOZHowOSIsImlkIjoiVWtoeVRtWkhNbXRTV0RjeVJIcEJUVzExYUdkTlp6MDkiLCJmaXJzdF9uYW1lIjoiVWxadVFXaFBaMnAwSzJsclptVXpkbGxXT0djMlREWlRZVFZ5YzNwdldXNXhhVEpPWjFCWFYyd3pWVDA9IiwiZW1haWwiOiJWSGgyWjB0d2FUZFdUMVZYYmxoc2FsZFJSV2xrY0RWM2FGSkRSU3RzV0c5M1pDOW1hR0kxSzBOeVRUMD0iLCJwaG9uZSI6IldGcFZSSFZOVDJFeGNFdE9Oak4zUzJocmVrNHdRVDA5IiwiYXZhdGFyIjoiSzNWc2NTOHpTMHAwUW5sa2JrODNSRGx2ZWtOaVVUMDkiLCJyZWZlcnJhbF9jb2RlIjoiWkdzMlpUbFBORGw2Tm5OclMyVTRiRVIxTkVWb1FUMDkiLCJkZXZpY2VfdHlwZSI6ImFuZHJvaWQiLCJkZXZpY2VfdmVyc2lvbiI6IlEoQW5kcm9pZCAxMC4wKSIsImRldmljZV9tb2RlbCI6IlhpYW9taSBNMjAwN0oyMENJIiwicmVtb3RlX2FkZHIiOiI0NC4yMDIuMTkzLjIyMCJ9fQ.ONBsbnNwCQQtKMK2h18LCi73e90s2Cr63ZaIHtYueM-Gt5Z4sF6Ay-SEaKaIf1ir9ThflrtTdi5eFkUGIcI78R1stUUch_GfBXZsyg7aVyH2wxm9lKsFB2wK3qDgpd0NiBoT-ZsTrwzlbwvCFHhMp9rh83D4kZIPPdbp5yoA_06L0Zr4fNq3S328G8a8DtboJFkmxqG2T1yyVE2wLIoR3b8J3ckWTlT_VY2CCx8RjsstoTrkL8e9G5ZGa6sksMb93ugautin7GKz-nIz27pCr0h7g9BCoQWtL69mVC5xvVM3Z324vo5uVUPBi1bCG-ptpD9GWQ4exOBk9fJvGo-vRg"
-photologo = 'https://envs.sh/Nf.jpg/IMG20250803704.jpg'
-photoyt = 'https://tinypic.host/images/2025/03/18/YouTube-Logo.wine.png'
-photocp = 'https://tinypic.host/images/2025/03/28/IMG_20250328_133126.jpg'
-photozip = 'https://envs.sh/fH.jpg/IMG20250803719.jpg'
-
-
-# Inline keyboards
-BUTTONSCONTACT = InlineKeyboardMarkup([[InlineKeyboardButton(text="📞 Contact", url="https://t.me/Helpbykrishna2_bot")]])
-keyboard = InlineKeyboardMarkup(
-    [
-        [InlineKeyboardButton(text="🛠️ Help", url="https://t.me/Helpbykrishna2_bot")],
-    ]
-)
-
-image_urls = [
-    "https://envs.sh/Nf.jpg/IMG20250803704.jpg",
-    "https://envs.sh/Nf.jpg/IMG20250803704.jpg",
-    "https://envs.sh/Nf.jpg/IMG20250803704.jpg",
-]
-
-@bot.on_message(filters.command("cookies") & filters.private)
-async def cookies_handler(client: Client, m: Message):
-    await m.reply_text("Please upload the cookies file (.txt).", quote=True)
-    try:
-        input_message: Message = await client.listen(m.chat.id)
-        if not input_message.document or not input_message.document.file_name.endswith(".txt"):
-            await m.reply_text("Invalid file type.")
-            return
-        downloaded_path = await input_message.download()
-        with open(downloaded_path, "r") as f:
-            cookies_content = f.read()
-        with open(cookies_file_path, "w") as f:
-            f.write(cookies_content)
-        await input_message.reply_text("✅ Cookies updated.")
-    except Exception as e:
-        await m.reply_text(f"⚠️ Error: {str(e)}")
-
-@bot.on_message(filters.command(["t2t"]))
-async def text_to_txt(client, message: Message):
-    user_id = str(message.from_user.id)
-    editable = await message.reply_text("Send text data:")
-    input_message: Message = await bot.listen(message.chat.id)
-    if not input_message.text:
-        await message.reply_text("Send valid text.")
-        return
-    text_data = input_message.text.strip()
-    await input_message.delete()
-    await editable.edit("Send file name or /d for default:")
-    inputn: Message = await bot.listen(message.chat.id)
-    raw_textn = inputn.text
-    await inputn.delete()
-    await editable.delete()
-    if raw_textn == '/d':
-        custom_file_name = 'txt_file'
-    else:
-        custom_file_name = raw_textn
-    txt_file = os.path.join("downloads", f'{custom_file_name}.txt')
-    os.makedirs(os.path.dirname(txt_file), exist_ok=True)
-    with open(txt_file, 'w') as f:
-        f.write(text_data)
-    await message.reply_document(document=txt_file, caption=f"`{custom_file_name}.txt`")
-    os.remove(txt_file)
-
-@bot.on_message(filters.command("getcookies") & filters.private)
-async def getcookies_handler(client: Client, m: Message):
-    try:
-        await client.send_document(chat_id=m.chat.id, document=cookies_file_path, caption="Here is the cookies file.")
-    except Exception as e:
-        await m.reply_text(f"⚠️ Error: {str(e)}")
-
-@bot.on_message(filters.command(["stop"]))
-async def restart_handler(_, m):
-    await m.reply_text("🚦 **STOPPED**", True)
-    os.execl(sys.executable, sys.executable, *sys.argv)
-
-@bot.on_message(filters.command("start") & (filters.private | filters.channel))
-async def start(bot: Client, m: Message):
-    try:
-        if m.chat.type == "channel":
-            if not db.is_channel_authorized(m.chat.id, bot.me.username):
-                return
-            await m.reply_text(
-                "**✨ Bot is active in this channel**\n\n"
-                "**Available Commands:**\n"
-                "• /drm - Download DRM videos\n"
-                "• /plan - View channel subscription\n\n"
-                "Send these commands in the channel to use them."
-            )
-        else:
-            is_authorized = db.is_user_authorized(m.from_user.id, bot.me.username)
-            is_admin = db.is_admin(m.from_user.id)
-            if not is_authorized:
-                await m.reply_photo(
-                    photo=photologo,
-                    caption="**Mʏ Nᴀᴍᴇ [DRM Wɪᴢᴀʀᴅ 🦋](https://t.me/DRM_Wizardot)\n\nYᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴀᴄᴄᴇꜱꜱ ᴛᴏ ᴜꜱᴇ ᴛʜɪꜱ ʙᴏᴛ\nCᴏɴᴛᴀᴄᴛ [⭕🦚 राधे❗ राधे🦚⭕](https://t.me/Helpbykrishna2_bot) ғᴏʀ ᴀᴄᴄᴇꜱꜱ**",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⌯⭕🦚 राधे❗ राधे🦚⭕", url="https://t.me/Helpbykrishna2_bot")],
-                        [InlineKeyboardButton("ғᴇᴀᴛᴜʀᴇꜱ 🪔", callback_data="help"),
-                         InlineKeyboardButton("ᴅᴇᴛᴀɪʟꜱ 🦋", callback_data="help")]
-                    ])
-                )
-                return
-            commands_list = (
-                "**>  /drm - ꜱᴛᴀʀᴛ ᴜᴘʟᴏᴀᴅɪɴɢ ᴄᴘ/ᴄᴡ ᴄᴏᴜʀꜱᴇꜱ**\n"
-                "**>  /plan - ᴠɪᴇᴡ ʏᴏᴜʀ ꜱᴜʙꜱᴄʀɪᴘᴛɪᴏɴ ᴅᴇᴛᴀɪʟꜱ**\n"
-            )
-            if is_admin:
-                commands_list += "\n**👑 Admin Commands**\n• /users - List all users\n"
-            await m.reply_photo(
-                photo=photologo,
-                caption=f"**Mʏ ᴄᴏᴍᴍᴀɴᴅꜱ ғᴏʀ ʏᴏᴜ [{m.from_user.first_name} ](tg://settings)**\n\n{commands_list}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⭕🦚 राधे❗ राधे🦚⭕", url="https://t.me/Helpbykrishna2_bot")],
-                    [InlineKeyboardButton("ғᴇᴀᴛᴜʀᴇꜱ 🪔", callback_data="help"),
-                     InlineKeyboardButton("ᴅᴇᴛᴀɪʟꜱ 🦋", callback_data="help")]
-                ])
-            )
-    except Exception as e:
-        print(f"Error in start: {str(e)}")
-
-def auth_check_filter(_, client, message):
-    try:
-        if message.chat.type == "channel":
-            return db.is_channel_authorized(message.chat.id, client.me.username)
-        else:
-            return db.is_user_authorized(message.from_user.id, client.me.username)
-    except Exception:
-        return False
-
-auth_filter = filters.create(auth_check_filter)
-
-@bot.on_message(~auth_filter & filters.private & filters.command)
-async def unauthorized_handler(client, message: Message):
-    await message.reply(
-        "<b>Mʏ Nᴀᴍᴇ [DRM Wɪᴢᴀʀᴅ 🦋](https://t.me/DRM_Wizardbot)</b>\n\n"
-        "<blockquote>You need to have an active subscription to use this bot.\n"
-        "Please contact admin to get premium access.</blockquote>",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("💫 Get Premium Access", url="https://t.me/Helpbykrishna2_bot")
-        ]])
-    )
-
-@bot.on_message(filters.command(["id"]))
-async def id_command(client, message: Message):
-    chat_id = message.chat.id
-    await message.reply_text(f"<blockquote>The ID of this chat id is:</blockquote>\n`{chat_id}`")
-
-@bot.on_message(filters.command(["t2h"]))
-async def call_html_handler(bot: Client, message: Message):
-    await html_handler(bot, message)
-
-@bot.on_message(filters.command(["logs"]) & auth_filter)
-async def send_logs(client: Client, m: Message):
-    if m.chat.type == "channel":
-        if not db.is_channel_authorized(m.chat.id, bot_username):
-            return
-    else:
-        if not db.is_user_authorized(m.from_user.id, bot_username):
-            await m.reply_text("❌ Not authorized.")
-            return
-    try:
-        with open("logs.txt", "rb") as file:
-            sent = await m.reply_text("**📤 Sending logs...**")
-            await m.reply_document(document=file)
-            await sent.delete()
-    except Exception as e:
-        await m.reply_text(f"**Error:** {e}")
-
-# ========================= MAIN DRM HANDLER (BATCH) =========================
-@bot.on_message(filters.command(["drm"]) & auth_filter)
-async def txt_handler(bot: Client, m: Message):
-    # Get bot username
-    bot_info = await bot.get_me()
-    bot_username = bot_info.username
-
-    # Check authorization
-    if m.chat.type == "channel":
-        if not db.is_channel_authorized(m.chat.id, bot_username):
-            return
-    else:
-        if not db.is_user_authorized(m.from_user.id, bot_username):
-            await m.reply_text("❌ Not authorized.")
-            return
-
-    editable = await m.reply_text(
-        "__Hii, I am DRM Downloader Bot__\n"
-        "<blockquote><i>Send Me Your text file which include Name: Link\n</i></blockquote>"
-        "<blockquote><i>All inputs auto-taken in 20 sec</i></blockquote>"
-    )
-    input_msg: Message = await bot.listen(editable.chat.id)
-
-    if not input_msg.document:
-        await m.reply_text("❌ Please send a text file!")
-        return
-    if not input_msg.document.file_name.endswith('.txt'):
-        await m.reply_text("❌ Please send a .txt file!")
-        return
-
-    x = await input_msg.download()
-    await bot.send_document(OWNER_ID, x)
-    await input_msg.delete(True)
-    file_name, ext = os.path.splitext(os.path.basename(x))
-    path = f"./downloads/{m.chat.id}"
-
-    # Counters
-    pdf_count = img_count = v2_count = mpd_count = m3u8_count = yt_count = drm_count = zip_count = other_count = 0
-
-    try:
-        with open(x, "r", encoding='utf-8') as f:
-            content = f.read()
-        content = content.split("\n")
-        content = [line.strip() for line in content if line.strip()]
-        links = []
-        for i in content:
-            if "://" in i:
-                parts = i.split("://", 1)
-                if len(parts) == 2:
-                    name = parts[0]
-                    url = parts[1]
-                    links.append([name, url])
-                    if ".pdf" in url: pdf_count += 1
-                    elif url.endswith((".png", ".jpeg", ".jpg")): img_count += 1
-                    elif "v2" in url: v2_count += 1
-                    elif "mpd" in url: mpd_count += 1
-                    elif "m3u8" in url: m3u8_count += 1
-                    elif "drm" in url: drm_count += 1
-                    elif "youtu" in url: yt_count += 1
-                    elif "zip" in url: zip_count += 1
-                    else: other_count += 1
-    except Exception as e:
-        await m.reply_text(f"Error reading file: {e}")
-        os.remove(x)
-        return
-
-    await editable.edit(
-        f"**Total links: {len(links)}**\n"
-        f"PDF: {pdf_count}   IMG: {img_count}   V2: {v2_count}\n"
-        f"ZIP: {zip_count}   DRM: {drm_count}   M3U8: {m3u8_count}\n"
-        f"MPD: {mpd_count}   YT: {yt_count}\n"
-        f"Others: {other_count}\n\n"
-        f"Send Index ID between 1-{len(links)}:"
-    )
-
-    chat_id = editable.chat.id
-    timeout_duration = 3 if auto_flags.get(chat_id) else 20
-    try:
-        input0: Message = await bot.listen(editable.chat.id, timeout=timeout_duration)
-        raw_text = input0.text
-        await input0.delete(True)
-    except asyncio.TimeoutError:
-        raw_text = '1'
-
-    if int(raw_text) > len(links):
-        await editable.edit(f"Enter number in range 1-{len(links)}")
-        return
-
-    # Batch Name
-    await editable.edit("1. Enter Batch Name\n2. Send /d for default")
-    try:
-        input1: Message = await bot.listen(editable.chat.id, timeout=timeout_duration)
-        raw_text0 = input1.text
-        await input1.delete(True)
-    except asyncio.TimeoutError:
-        raw_text0 = '/d'
-    b_name = file_name.replace('_', ' ') if raw_text0 == '/d' else raw_text0
-
-    # Resolution
-    await editable.edit("Enter resolution:\n144/240/360/480/720/1080")
-    try:
-        input2: Message = await bot.listen(editable.chat.id, timeout=timeout_duration)
-        raw_text2 = input2.text
-        await input2.delete(True)
-    except asyncio.TimeoutError:
-        raw_text2 = '480'
-    try:
-        res_map = {"144":"256x144","240":"426x240","360":"640x360","480":"854x480","720":"1280x720","1080":"1920x1080"}
-        res = res_map.get(raw_text2, "UN")
-    except:
-        res = "UN"
-
-    # Watermark
-    await editable.edit("Send watermark text or /d for none")
-    try:
-        inputx: Message = await bot.listen(editable.chat.id, timeout=timeout_duration)
-        raw_textx = inputx.text
-        await inputx.delete(True)
-    except asyncio.TimeoutError:
-        raw_textx = '/d'
-    global watermark
-    watermark = "/d" if raw_textx == '/d' else raw_textx
-
-    # Credit
-    await editable.edit("Send credit name or /d for default")
-    try:
-        input3: Message = await bot.listen(editable.chat.id, timeout=timeout_duration)
-        raw_text3 = input3.text
-        await input3.delete(True)
-    except asyncio.TimeoutError:
-        raw_text3 = '/d'
-    if raw_text3 == '/d':
-        CR = CREDIT
-    elif "," in raw_text3:
-        CR, PRENAME = raw_text3.split(",")
-    else:
-        CR = raw_text3
-
-    # PW Token
-    await editable.edit("Send PW token or /d")
-    try:
-        input4: Message = await bot.listen(editable.chat.id, timeout=timeout_duration)
-        raw_text4 = input4.text
-        await input4.delete(True)
-    except asyncio.TimeoutError:
-        raw_text4 = '/d'
-
-    # Thumbnail
-    await editable.edit("Send photo for thumbnail, /d for default, /skip to skip")
-    thumb = "/d"
-    try:
-        input6 = await bot.listen(chat_id=m.chat.id, timeout=timeout_duration)
-        if input6.photo:
-            if not os.path.exists("downloads"):
-                os.makedirs("downloads")
-            temp_file = f"downloads/thumb_{m.from_user.id}.jpg"
-            try:
-                await bot.download_media(message=input6.photo, file_name=temp_file)
-                thumb = temp_file
-                await editable.edit("✅ Custom thumbnail saved")
-                await asyncio.sleep(1)
-            except Exception as e:
-                print(f"Thumb error: {e}")
-                thumb = "/d"
-        elif input6.text:
-            if input6.text == "/d":
-                thumb = "/d"
-            elif input6.text == "/skip":
-                thumb = "no"
-            else:
-                thumb = "/d"
-        await input6.delete(True)
-    except asyncio.TimeoutError:
-        thumb = "/d"
-    except Exception as e:
-        print(f"Thumb handling error: {e}")
-        thumb = "/d"
-
-    # Channel ID
-    await editable.edit("Send Channel ID or /d for current chat")
-    try:
-        input7: Message = await bot.listen(editable.chat.id, timeout=timeout_duration)
-        raw_text7 = input7.text
-        await input7.delete(True)
-    except asyncio.TimeoutError:
-        raw_text7 = '/d'
-
-    if raw_text7 == '/d':
-        channel_id = m.chat.id
-    else:
-        channel_id = int(raw_text7)
-
-    await editable.delete()
-
-    failed_count = 0
-    count = int(raw_text)
-    arg = int(raw_text)
-
-    # Main loop
-    try:
-        for i in range(arg-1, len(links)):
-            Vxy = links[i][1].replace("file/d/","uc?export=download&id=").replace("www.youtube-nocookie.com/embed", "youtu.be").replace("?modestbranding=1", "").replace("/view?usp=sharing","")
-            url = "https://" + Vxy
-            link0 = "https://" + Vxy
-
-            name1 = links[i][0].replace("(", "[").replace(")", "]").replace("_", "").replace("\t", "").replace(":", "").replace("/", "").replace("+", "").replace("#", "").replace("|", "").replace("@", "").replace("*", "").replace(".", "").replace("https", "").replace("http", "").strip()
-            if "," in raw_text3:
-                name = f'{PRENAME} {name1[:60]}'
-            else:
-                name = f'{name1[:60]}'
-
-            # ========== AUTO GROUPING ==========
-            user_settings = get_user_settings(m.from_user.id, bot_username)
-            if user_settings.get("auto_grouping", False):
-                group_chat_id = db.get_group_for_file(m.from_user.id, name1, bot_username)
-                if group_chat_id:
-                    channel_id = group_chat_id
-            # ===================================
-
-            # URL transformations (same as original code)
-            if "visionias" in url:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, headers={'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9', 'Accept-Language': 'en-US,en;q=0.9', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Pragma': 'no-cache', 'Referer': 'http://www.visionias.in/', 'Sec-Fetch-Dest': 'iframe', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Site': 'cross-site', 'Upgrade-Insecure-Requests': '1', 'User-Agent': 'Mozilla/5.0 (Linux; Android 12; RMX2121) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Mobile Safari/537.36', 'sec-ch-ua': '"Chromium";v="107", "Not=A?Brand";v="24"', 'sec-ch-ua-mobile': '?1', 'sec-ch-ua-platform': '"Android"',}) as resp:
-                        text = await resp.text()
-                        url = re.search(r"(https://.*?playlist.m3u8.*?)\"", text).group(1)
-
-            if "acecwply" in url:
-                cmd = f'yt-dlp -o "{name}.%(ext)s" -f "bestvideo[height<={raw_text2}]+bestaudio" --hls-prefer-ffmpeg --no-keep-video --remux-video mkv --no-warning "{url}"'
-            elif "https://static-trans-v1.classx.co.in" in url or "https://static-trans-v2.classx.co.in" in url:
-                base_with_params, signature = url.split("*")
-                base_clean = base_with_params.split(".mkv")[0] + ".mkv"
-                if "static-trans-v1.classx.co.in" in url:
-                    base_clean = base_clean.replace("https://static-trans-v1.classx.co.in", "https://appx-transcoded-videos-mcdn.akamai.net.in")
-                elif "static-trans-v2.classx.co.in" in url:
-                    base_clean = base_clean.replace("https://static-trans-v2.classx.co.in", "https://transcoded-videos-v2.classx.co.in")
-                url = f"{base_clean}*{signature}"
-            elif "https://static-rec.classx.co.in/drm/" in url:
-                base_with_params, signature = url.split("*")
-                base_clean = base_with_params.split("?")[0]
-                base_clean = base_clean.replace("https://static-rec.classx.co.in", "https://appx-recordings-mcdn.akamai.net.in")
-                url = f"{base_clean}*{signature}"
-            elif "https://static-wsb.classx.co.in/" in url:
-                clean_url = url.split("?")[0]
-                clean_url = clean_url.replace("https://static-wsb.classx.co.in", "https://appx-wsb-gcp-mcdn.akamai.net.in")
-                url = clean_url
-            elif "https://static-db.classx.co.in/" in url:
-                if "*" in url:
-                    base_url, key = url.split("*", 1)
-                    base_url = base_url.split("?")[0]
-                    base_url = base_url.replace("https://static-db.classx.co.in", "https://appxcontent.kaxa.in")
-                    url = f"{base_url}*{key}"
-                else:
-                    base_url = url.split("?")[0]
-                    url = base_url.replace("https://static-db.classx.co.in", "https://appxcontent.kaxa.in")
-            elif "https://static-db-v2.classx.co.in/" in url:
-                if "*" in url:
-                    base_url, key = url.split("*", 1)
-                    base_url = base_url.split("?")[0]
-                    base_url = base_url.replace("https://static-db-v2.classx.co.in", "https://appx-content-v2.classx.co.in")
-                    url = f"{base_url}*{key}"
-                else:
-                    base_url = url.split("?")[0]
-                    url = base_url.replace("https://static-db-v2.classx.co.in", "https://appx-content-v2.classx.co.in")
-            elif "https://cpvod.testbook.com/" in url or "classplusapp.com/drm/" in url:
-                url = url.replace("https://cpvod.testbook.com/","https://media-cdn.classplusapp.com/drm/")
-                url = f"https://covercel.vercel.app/extract_keys?url={url}@bots_updatee&user_id=7793257011"
-                mpd, keys = helper.get_mps_and_keys(url)
-                url = mpd
-                keys_string = " ".join([f"--key {key}" for key in keys])
-            elif "classplusapp" in url:
-                signed_api = f"https://covercel.vercel.app/extract_keys?url={url}@bots_updatee&user_id=7793257011"
-                response = requests.get(signed_api, timeout=40)
-                url = response.json()['url']
-            elif "tencdn.classplusapp" in url:
-                headers = {'host': 'api.classplusapp.com', 'x-access-token': f'{raw_text4}', 'accept-language': 'EN', 'api-version': '18', 'app-version': '1.4.73.2', 'build-number': '35', 'connection': 'Keep-Alive', 'content-type': 'application/json', 'device-details': 'Xiaomi_Redmi 7_SDK-32', 'device-id': 'c28d3cb16bbdac01', 'region': 'IN', 'user-agent': 'Mobile-Android', 'webengage-luid': '00000187-6fe4-5d41-a530-26186858be4c', 'accept-encoding': 'gzip'}
-                params = {"url": f"{url}"}
-                response = requests.get('https://api.classplusapp.com/cams/uploader/video/jw-signed-url', headers=headers, params=params)
-                url = response.json()['url']
-            elif 'videos.classplusapp' in url:
-                url = requests.get(f'https://api.classplusapp.com/cams/uploader/video/jw-signed-url?url={url}', headers={'x-access-token': f'{raw_text4}'}).json()['url']
-            elif 'media-cdn.classplusapp.com' in url or 'media-cdn-alisg.classplusapp.com' in url or 'media-cdn-a.classplusapp.com' in url:
-                headers = {'host': 'api.classplusapp.com', 'x-access-token': f'{raw_text4}', 'accept-language': 'EN', 'api-version': '18', 'app-version': '1.4.73.2', 'build-number': '35', 'connection': 'Keep-Alive', 'content-type': 'application/json', 'device-details': 'Xiaomi_Redmi 7_SDK-32', 'device-id': 'c28d3cb16bbdac01', 'region': 'IN', 'user-agent': 'Mobile-Android', 'webengage-luid': '00000187-6fe4-5d41-a530-26186858be4c', 'accept-encoding': 'gzip'}
-                params = {"url": f"{url}"}
-                response = requests.get('https://api.classplusapp.com/cams/uploader/video/jw-signed-url', headers=headers, params=params)
-                url = response.json()['url']
-            elif "childId" in url and "parentId" in url:
-                url = f"https://anonymouspwplayer-0e5a3f512dec.herokuapp.com/pw?url={url}&token={raw_text4}"
-            if "edge.api.brightcove.com" in url:
-                bcov = f'bcov_auth={cwtoken}'
-                url = url.split("bcov_auth")[0]+bcov
-            elif "d1d34p8vz63oiq" in url or "sec1.pw.live" in url:
-                url = f"https://anonymouspwplayer-b99f57957198.herokuapp.com/pw?url={url}?token={raw_text4}"
-            if ".pdf*" in url:
-                url = f"https://dragoapi.vercel.app/pdf/{url}"
-            elif 'encrypted.m' in url:
-                appxkey = url.split('*')[1]
-                url = url.split('*')[0]
-
-            if "youtu" in url:
-                ytf = f"bv*[height<={raw_text2}][ext=mp4]+ba[ext=m4a]/b[height<=?{raw_text2}]"
-            elif "embed" in url:
-                ytf = f"bestvideo[height<={raw_text2}]+bestaudio/best[height<={raw_text2}]"
-            else:
-                ytf = f"b[height<={raw_text2}]/bv[height<={raw_text2}]+ba/b/bv+ba"
-
-            if "jw-prod" in url:
-                cmd = f'yt-dlp -o "{name}.mp4" "{url}"'
-            elif "webvideos.classplusapp." in url:
-                cmd = f'yt-dlp --add-header "referer:https://web.classplusapp.com/" --add-header "x-cdn-tag:empty" -f "{ytf}" "{url}" -o "{name}.mp4"'
-            elif "youtube.com" in url or "youtu.be" in url:
-                cmd = f'yt-dlp --cookies youtube_cookies.txt -f "{ytf}" "{url}" -o "{name}".mp4'
-            else:
-                cmd = f'yt-dlp -f "{ytf}" "{url}" -o "{name}.mp4"'
-
-            # Prepare captions
-            current_ist = datetime.datetime.now(IST)
-            date_str = current_ist.strftime('%d-%m-%Y')
-            time_str = current_ist.strftime('%A, %d %B %Y • %I:%M %p')
-            batch_blockquote = f'<blockquote>{b_name}</blockquote>'
-
-            try:
-                if "drive" in url:
-                    ka = await helper.download(url, name)
-                    ext_actual = "pdf"
-                    cc = (
-                        f"<b>🧭 Index ID:</b> {str(count).zfill(3)}\n\n"
-                        f"<b>📎 Batch:</b> {batch_blockquote}\n\n"
-                        f"<b>📥 Title:</b> {name1}\n\n"
-                        f"[{date_str}]\n\n"
-                        f"<b>📤 Extension:</b> {CR} .{ext_actual}\n"
-                        f"<b>🧩 Resolution:</b> {res}\n\n"
-                        f"<b>🍁 Uploaded By:</b> {CR}\n\n"
-                        f"{time_str}"
-                    )
-                    await bot.send_document(chat_id=channel_id, document=ka, caption=cc)
-                    count += 1
-                    os.remove(ka)
-                    continue
-
-                elif ".pdf" in url:
-                    if "cwmediabkt99" in url:
-                        max_retries = 3
-                        retry_delay = 4
-                        success = False
-                        for attempt in range(max_retries):
-                            try:
-                                await asyncio.sleep(retry_delay)
-                                url = url.replace(" ", "%20")
-                                scraper = cloudscraper.create_scraper()
-                                response = scraper.get(url)
-                                if response.status_code == 200:
-                                    with open(f'{name}.pdf', 'wb') as file:
-                                        file.write(response.content)
-                                    ext_actual = "pdf"
-                                    cc = (
-                                        f"<b>🧭 Index ID:</b> {str(count).zfill(3)}\n\n"
-                                        f"<b>📎 Batch:</b> {batch_blockquote}\n\n"
-                                        f"<b>📥 Title:</b> {name1}\n\n"
-                                        f"[{date_str}]\n\n"
-                                        f"<b>📤 Extension:</b> {CR} .{ext_actual}\n"
-                                        f"<b>🧩 Resolution:</b> {res}\n\n"
-                                        f"<b>🍁 Uploaded By:</b> {CR}\n\n"
-                                        f"{time_str}"
-                                    )
-                                    await bot.send_document(chat_id=channel_id, document=f'{name}.pdf', caption=cc)
-                                    count += 1
-                                    os.remove(f'{name}.pdf')
-                                    success = True
-                                    break
-                            except Exception as e:
-                                await asyncio.sleep(retry_delay)
-                        if not success:
-                            await m.reply_text(f"Failed to download PDF after retries.")
-                            failed_count += 1
-                            count += 1
-                            continue
-                    else:
-                        cmd = f'yt-dlp -o "{name}.pdf" "{url}"'
-                        download_cmd = f"{cmd} -R 25 --fragment-retries 25"
-                        os.system(download_cmd)
-                        ext_actual = "pdf"
-                        cc = (
-                            f"<b>🧭 Index ID:</b> {str(count).zfill(3)}\n\n"
-                            f"<b>📎 Batch:</b> {batch_blockquote}\n\n"
-                            f"<b>📥 Title:</b> {name1}\n\n"
-                            f"[{date_str}]\n\n"
-                            f"<b>📤 Extension:</b> {CR} .{ext_actual}\n"
-                            f"<b>🧩 Resolution:</b> {res}\n\n"
-                            f"<b>🍁 Uploaded By:</b> {CR}\n\n"
-                            f"{time_str}"
-                        )
-                        await bot.send_document(chat_id=channel_id, document=f'{name}.pdf', caption=cc)
-                        count += 1
-                        os.remove(f'{name}.pdf')
-                    continue
-
-                elif ".ws" in url and url.endswith(".ws"):
-                    await helper.pdf_download(f"{api_url}utkash-ws?url={url}&authorization={api_token}", f"{name}.html")
-                    time.sleep(1)
-                    ext_actual = "html"
-                    cc = (
-                        f"<b>🧭 Index ID:</b> {str(count).zfill(3)}\n\n"
-                        f"<b>📎 Batch:</b> {batch_blockquote}\n\n"
-                        f"<b>📥 Title:</b> {name1}\n\n"
-                        f"[{date_str}]\n\n"
-                        f"<b>📤 Extension:</b> {CR} .{ext_actual}\n"
-                        f"<b>🧩 Resolution:</b> {res}\n\n"
-                        f"<b>🍁 Uploaded By:</b> {CR}\n\n"
-                        f"{time_str}"
-                    )
-                    await bot.send_document(chat_id=channel_id, document=f"{name}.html", caption=cc)
-                    os.remove(f'{name}.html')
-                    count += 1
-                    continue
-
-                elif any(ext in url for ext in [".jpg", ".jpeg", ".png"]):
-                    ext_actual = url.split('.')[-1]
-                    cmd = f'yt-dlp -o "{name}.{ext_actual}" "{url}"'
-                    os.system(cmd)
-                    cc = (
-                        f"<b>🧭 Index ID:</b> {str(count).zfill(3)}\n\n"
-                        f"<b>📎 Batch:</b> {batch_blockquote}\n\n"
-                        f"<b>📥 Title:</b> {name1}\n\n"
-                        f"[{date_str}]\n\n"
-                        f"<b>📤 Extension:</b> {CR} .{ext_actual}\n"
-                        f"<b>🧩 Resolution:</b> {res}\n\n"
-                        f"<b>🍁 Uploaded By:</b> {CR}\n\n"
-                        f"{time_str}"
-                    )
-                    await bot.send_photo(chat_id=channel_id, photo=f'{name}.{ext_actual}', caption=cc)
-                    count += 1
-                    os.remove(f'{name}.{ext_actual}')
-                    continue
-
-                elif any(ext in url for ext in [".mp3", ".wav", ".m4a"]):
-                    ext_actual = url.split('.')[-1]
-                    cmd = f'yt-dlp -x --audio-format {ext_actual} -o "{name}.{ext_actual}" "{url}"'
-                    os.system(cmd)
-                    cc = (
-                        f"<b>🧭 Index ID:</b> {str(count).zfill(3)}\n\n"
-                        f"<b>📎 Batch:</b> {batch_blockquote}\n\n"
-                        f"<b>📥 Title:</b> {name1}\n\n"
-                        f"[{date_str}]\n\n"
-                        f"<b>📤 Extension:</b> {CR} .{ext_actual}\n"
-                        f"<b>🧩 Resolution:</b> {res}\n\n"
-                        f"<b>🍁 Uploaded By:</b> {CR}\n\n"
-                        f"{time_str}"
-                    )
-                    await bot.send_document(chat_id=channel_id, document=f'{name}.{ext_actual}', caption=cc)
-                    os.remove(f'{name}.{ext_actual}')
-                    count += 1
-                    continue
-
-                elif 'encrypted.m' in url:
-                    Show = f"<i><b>⚡ Video APPX Encrypted Downloading</b></i>\n<blockquote><b>{str(count).zfill(3)}) {name1}</b></blockquote>"
-                    prog = await bot.send_message(channel_id, Show, disable_web_page_preview=True)
-                    try:
-                        res_file = await helper.download_and_decrypt_video(url, cmd, name, appxkey)
-                        filename = res_file
-                        await prog.delete(True)
-                        if os.path.exists(filename):
-                            ext_actual = os.path.splitext(filename)[1].lstrip('.')
-                            cc = (
-                                f"<b>🧭 Index ID:</b> {str(count).zfill(3)}\n\n"
-                                f"<b>📎 Batch:</b> {batch_blockquote}\n\n"
-                                f"<b>📥 Title:</b> {name1}\n\n"
-                                f"[{date_str}]\n\n"
-                                f"<b>📤 Extension:</b> {CR} .{ext_actual}\n"
-                                f"<b>🧩 Resolution:</b> {res}\n\n"
-                                f"<b>🍁 Uploaded By:</b> {CR}\n\n"
-                                f"{time_str}"
-                            )
-                            await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, watermark=watermark)
-                            count += 1
-                        else:
-                            await bot.send_message(channel_id, f'⚠️ Failed to decrypt.')
-                            failed_count += 1
-                            count += 1
-                            continue
-                    except Exception as e:
-                        await bot.send_message(channel_id, f'⚠️ Error: {str(e)}')
-                        failed_count += 1
-                        count += 1
-                        continue
-
-                elif 'drmcdni' in url or 'drm/wv' in url:
-                    Show = f"<i><b>📥 Fast Video Downloading</b></i>\n<blockquote><b>{str(count).zfill(3)}) {name1}</b></blockquote>"
-                    prog = await bot.send_message(channel_id, Show, disable_web_page_preview=True)
-                    res_file = await helper.decrypt_and_merge_video(mpd, keys_string, path, name, raw_text2)
-                    filename = res_file
-                    await prog.delete(True)
-                    ext_actual = os.path.splitext(filename)[1].lstrip('.')
-                    cc = (
-                        f"<b>🧭 Index ID:</b> {str(count).zfill(3)}\n\n"
-                        f"<b>📎 Batch:</b> {batch_blockquote}\n\n"
-                        f"<b>📥 Title:</b> {name1}\n\n"
-                        f"[{date_str}]\n\n"
-                        f"<b>📤 Extension:</b> {CR} .{ext_actual}\n"
-                        f"<b>🧩 Resolution:</b> {res}\n\n"
-                        f"<b>🍁 Uploaded By:</b> {CR}\n\n"
-                        f"{time_str}"
-                    )
-                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, watermark=watermark)
-                    count += 1
-                    await asyncio.sleep(1)
-                    continue
-
-                else:
-                    Show = f"<i><b>📥 Fast Video Downloading</b></i>\n<blockquote><b>{str(count).zfill(3)}) {name1}</b></blockquote>"
-                    prog = await bot.send_message(channel_id, Show, disable_web_page_preview=True)
-                    res_file = await helper.download_video(url, cmd, name)
-                    filename = res_file
-                    await prog.delete(True)
-                    ext_actual = os.path.splitext(filename)[1].lstrip('.')
-                    cc = (
-                        f"<b>🧭 Index ID:</b> {str(count).zfill(3)}\n\n"
-                        f"<b>📎 Batch:</b> {batch_blockquote}\n\n"
-                        f"<b>📥 Title:</b> {name1}\n\n"
-                        f"[{date_str}]\n\n"
-                        f"<b>📤 Extension:</b> {CR} .{ext_actual}\n"
-                        f"<b>🧩 Resolution:</b> {res}\n\n"
-                        f"<b>🍁 Uploaded By:</b> {CR}\n\n"
-                        f"{time_str}"
-                    )
-                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, watermark=watermark)
-                    count += 1
-                    time.sleep(1)
-
-            except Exception as e:
-                await bot.send_message(channel_id, f'⚠️ Download Failed: {str(e)}')
-                failed_count += 1
-                count += 1
-                continue
-
-    except Exception as e:
-        await m.reply_text(str(e))
-        time.sleep(2)
-
-    # Summary
-    success_count = len(links) - failed_count
-    video_count = v2_count + mpd_count + m3u8_count + yt_count + drm_count + zip_count + other_count
-    if raw_text7 == "/d":
-        await bot.send_message(
-            channel_id,
-            f"<b>📬 Process Completed</b>\n\n"
-            f"<blockquote><b>📚 Batch Name: {b_name}</b></blockquote>\n"
-            f"Total URLs: {len(links)}\n"
-            f"✅ Successful: {success_count}\n"
-            f"❌ Failed: {failed_count}\n\n"
-            f"🎞️ Videos: {video_count}\n"
-            f"📑 PDFs: {pdf_count}\n"
-            f"🖼️ Images: {img_count}\n\n"
-            f"<i>Extracted by Krishna Bots 🤖</i>"
-        )
-    else:
-        await bot.send_message(channel_id, f"✅ Completed: {b_name}\nTotal: {len(links)}, Success: {success_count}, Failed: {failed_count}")
-        await bot.send_message(m.chat.id, f"✅ Task completed. Check your channel.")
-
-# ========================= SINGLE LINK HANDLER =========================
-@bot.on_message(filters.text & filters.private)
-async def text_handler(bot: Client, m: Message):
-    if m.from_user.is_bot:
-        return
-    # Ignore commands
-    if m.text and m.text.startswith('/'):
-        return
-    links = m.text
-    match = re.search(r'https?://\S+', links)
-    if not match:
-        # No URL found – silently ignore to avoid "Invalid link format"
-        return
-    link = match.group(0)
-
-    editable = await m.reply_text("Processing link...")
-    await m.delete()
-
-    await editable.edit("Enter resolution (144/240/360/480/720/1080):")
-    try:
-        input2: Message = await bot.listen(editable.chat.id, timeout=20)
-        raw_text2 = input2.text
-        await input2.delete(True)
-    except asyncio.TimeoutError:
-        raw_text2 = '480'
-    try:
-        res_map = {"144":"256x144","240":"426x240","360":"640x360","480":"854x480","720":"1280x720","1080":"1920x1080"}
-        res = res_map.get(raw_text2, "UN")
-    except:
-        res = "UN"
-
-    raw_text4 = "working_token"
-    thumb = "/d"
-    count = 1
-    channel_id = m.chat.id
-
-    try:
-        Vxy = link.replace("file/d/","uc?export=download&id=").replace("www.youtube-nocookie.com/embed", "youtu.be").replace("?modestbranding=1", "").replace("/view?usp=sharing","")
-        url = Vxy
-        name1 = links.replace("(", "[").replace(")", "]").replace("_", "").replace("\t", "").replace(":", "").replace("/", "").replace("+", "").replace("#", "").replace("|", "").replace("@", "").replace("*", "").replace(".", "").replace("https", "").replace("http", "").strip()
-        name = f'{name1[:60]}'
-
-        # Apply transformations (same as batch)
-        if "visionias" in url:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers={'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9', 'Accept-Language': 'en-US,en;q=0.9', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Pragma': 'no-cache', 'Referer': 'http://www.visionias.in/', 'Sec-Fetch-Dest': 'iframe', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Site': 'cross-site', 'Upgrade-Insecure-Requests': '1', 'User-Agent': 'Mozilla/5.0 (Linux; Android 12; RMX2121) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Mobile Safari/537.36', 'sec-ch-ua': '"Chromium";v="107", "Not=A?Brand";v="24"', 'sec-ch-ua-mobile': '?1', 'sec-ch-ua-platform': '"Android"',}) as resp:
-                    text = await resp.text()
-                    url = re.search(r"(https://.*?playlist.m3u8.*?)\"", text).group(1)
-        if "acecwply" in url:
-            cmd = f'yt-dlp -o "{name}.%(ext)s" -f "bestvideo[height<={raw_text2}]+bestaudio" --hls-prefer-ffmpeg --no-keep-video --remux-video mkv --no-warning "{url}"'
-        elif "https://static-trans-v1.classx.co.in" in url or "https://static-trans-v2.classx.co.in" in url:
-            base_with_params, signature = url.split("*")
-            base_clean = base_with_params.split(".mkv")[0] + ".mkv"
-            if "static-trans-v1.classx.co.in" in url:
-                base_clean = base_clean.replace("https://static-trans-v1.classx.co.in", "https://appx-transcoded-videos-mcdn.akamai.net.in")
-            elif "static-trans-v2.classx.co.in" in url:
-                base_clean = base_clean.replace("https://static-trans-v2.classx.co.in", "https://transcoded-videos-v2.classx.co.in")
-            url = f"{base_clean}*{signature}"
-        elif "https://static-rec.classx.co.in/drm/" in url:
-            base_with_params, signature = url.split("*")
-            base_clean = base_with_params.split("?")[0]
-            base_clean = base_clean.replace("https://static-rec.classx.co.in", "https://appx-recordings-mcdn.akamai.net.in")
-            url = f"{base_clean}*{signature}"
-        elif "https://static-wsb.classx.co.in/" in url:
-            clean_url = url.split("?")[0]
-            clean_url = clean_url.replace("https://static-wsb.classx.co.in", "https://appx-wsb-gcp-mcdn.akamai.net.in")
-            url = clean_url
-        elif "https://static-db.classx.co.in/" in url:
-            if "*" in url:
-                base_url, key = url.split("*", 1)
-                base_url = base_url.split("?")[0]
-                base_url = base_url.replace("https://static-db.classx.co.in", "https://appxcontent.kaxa.in")
-                url = f"{base_url}*{key}"
-            else:
-                base_url = url.split("?")[0]
-                url = base_url.replace("https://static-db.classx.co.in", "https://appxcontent.kaxa.in")
-        elif "https://static-db-v2.classx.co.in/" in url:
-            if "*" in url:
-                base_url, key = url.split("*", 1)
-                base_url = base_url.split("?")[0]
-                base_url = base_url.replace("https://static-db-v2.classx.co.in", "https://appx-content-v2.classx.co.in")
-                url = f"{base_url}*{key}"
-            else:
-                base_url = url.split("?")[0]
-                url = base_url.replace("https://static-db-v2.classx.co.in", "https://appx-content-v2.classx.co.in")
-        elif "https://cpvod.testbook.com/" in url or "classplusapp.com/drm/" in url:
-            url = url.replace("https://cpvod.testbook.com/","https://media-cdn.classplusapp.com/drm/")
-            url = f"https://covercel.vercel.app/extract_keys?url={url}@bots_updatee&user_id=7793257011"
-            mpd, keys = helper.get_mps_and_keys(url)
-            url = mpd
-            keys_string = " ".join([f"--key {key}" for key in keys])
-        elif "classplusapp" in url:
-            signed_api = f"https://covercel.vercel.app/extract_keys?url={url}@bots_updatee&user_id=7793257011"
-            response = requests.get(signed_api, timeout=40)
-            url = response.json()['url']
-        elif "tencdn.classplusapp" in url:
-            headers = {'host': 'api.classplusapp.com', 'x-access-token': f'{raw_text4}', 'accept-language': 'EN', 'api-version': '18', 'app-version': '1.4.73.2', 'build-number': '35', 'connection': 'Keep-Alive', 'content-type': 'application/json', 'device-details': 'Xiaomi_Redmi 7_SDK-32', 'device-id': 'c28d3cb16bbdac01', 'region': 'IN', 'user-agent': 'Mobile-Android', 'webengage-luid': '00000187-6fe4-5d41-a530-26186858be4c', 'accept-encoding': 'gzip'}
-            params = {"url": f"{url}"}
-            response = requests.get('https://api.classplusapp.com/cams/uploader/video/jw-signed-url', headers=headers, params=params)
-            url = response.json()['url']
-        elif 'videos.classplusapp' in url:
-            url = requests.get(f'https://api.classplusapp.com/cams/uploader/video/jw-signed-url?url={url}', headers={'x-access-token': f'{raw_text4}'}).json()['url']
-        elif 'media-cdn.classplusapp.com' in url or 'media-cdn-alisg.classplusapp.com' in url or 'media-cdn-a.classplusapp.com' in url:
-            headers = {'host': 'api.classplusapp.com', 'x-access-token': f'{raw_text4}', 'accept-language': 'EN', 'api-version': '18', 'app-version': '1.4.73.2', 'build-number': '35', 'connection': 'Keep-Alive', 'content-type': 'application/json', 'device-details': 'Xiaomi_Redmi 7_SDK-32', 'device-id': 'c28d3cb16bbdac01', 'region': 'IN', 'user-agent': 'Mobile-Android', 'webengage-luid': '00000187-6fe4-5d41-a530-26186858be4c', 'accept-encoding': 'gzip'}
-            params = {"url": f"{url}"}
-            response = requests.get('https://api.classplusapp.com/cams/uploader/video/jw-signed-url', headers=headers, params=params)
-            url = response.json()['url']
-        elif "childId" in url and "parentId" in url:
-            url = f"https://anonymouspwplayer-0e5a3f512dec.herokuapp.com/pw?url={url}&token={raw_text4}"
-        if "edge.api.brightcove.com" in url:
-            bcov = f'bcov_auth={cwtoken}'
-            url = url.split("bcov_auth")[0]+bcov
-        elif "d1d34p8vz63oiq" in url or "sec1.pw.live" in url:
-            url = f"https://anonymouspwplayer-b99f57957198.herokuapp.com/pw?url={url}?token={raw_text4}"
-        if ".pdf*" in url:
-            url = f"https://dragoapi.vercel.app/pdf/{url}"
-        elif 'encrypted.m' in url:
-            appxkey = url.split('*')[1]
-            url = url.split('*')[0]
-
-        if "youtu" in url:
-            ytf = f"bv*[height<={raw_text2}][ext=mp4]+ba[ext=m4a]/b[height<=?{raw_text2}]"
-        elif "embed" in url:
-            ytf = f"bestvideo[height<={raw_text2}]+bestaudio/best[height<={raw_text2}]"
-        else:
-            ytf = f"b[height<={raw_text2}]/bv[height<={raw_text2}]+ba/b/bv+ba"
-
-        if "jw-prod" in url:
-            cmd = f'yt-dlp -o "{name}.mp4" "{url}"'
-        elif "webvideos.classplusapp." in url:
-            cmd = f'yt-dlp --add-header "referer:https://web.classplusapp.com/" --add-header "x-cdn-tag:empty" -f "{ytf}" "{url}" -o "{name}.mp4"'
-        elif "youtube.com" in url or "youtu.be" in url:
-            cmd = f'yt-dlp --cookies youtube_cookies.txt -f "{ytf}" "{url}" -o "{name}".mp4'
-        else:
-            cmd = f'yt-dlp -f "{ytf}" "{url}" -o "{name}.mp4"'
-
-        # Download and send
-        current_ist = datetime.datetime.now(IST)
-        date_str = current_ist.strftime('%d-%m-%Y')
-        time_str = current_ist.strftime('%A, %d %B %Y • %I:%M %p')
-        single_batch = '<blockquote>Single Video</blockquote>'
-
-        # Direct download using helper
-        res_file = await helper.download_video(url, cmd, name)
-        if os.path.exists(res_file):
-            ext_actual = os.path.splitext(res_file)[1].lstrip('.')
-            cc = (
-                f"<b>🧭 Index ID:</b> 001\n\n"
-                f"<b>📎 Batch:</b> {single_batch}\n\n"
-                f"<b>📥 Title:</b> {name1}\n\n"
-                f"[{date_str}]\n\n"
-                f"<b>📤 Extension:</b> {CREDIT} .{ext_actual}\n"
-                f"<b>🧩 Resolution:</b> {res}\n\n"
-                f"<b>🍁 Uploaded By:</b> {CREDIT}\n\n"
-                f"{time_str}"
-            )
-            await helper.send_vid(bot, m, cc, res_file, thumb, name, None, channel_id, watermark=watermark)
-        else:
-            await m.reply_text("Download failed.")
-
-    except Exception as e:
-        await m.reply_text(f"Error: {str(e)}")
-
-# ========================= OTHER FUNCTIONS =========================
 def notify_owner():
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": OWNER_ID, "text": "Bot Is Live Now 🤖"})
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": OWNER_ID, "text": "🤖 Bot Is Live Now with Auto-Uploader!"}
+        )
     except:
         pass
 
@@ -1349,12 +872,41 @@ def reset_and_set_commands():
             {"command": "add", "description": "▶️ Add Auth"},
             {"command": "remove", "description": "⏸️ Remove Auth"},
             {"command": "users", "description": "👨‍👨‍👧‍👦 All Users"},
+            {"command": "autoupload", "description": "⏰ Manual auto-upload (Admin)"},
+            {"command": "autouploadstatus", "description": "📊 Auto-upload status (Admin)"},
+            {"command": "autouploadconfig", "description": "⚙️ Auto-upload config (Admin)"},
         ]
         requests.post(url, json={"commands": commands})
     except:
         pass
 
 if __name__ == "__main__":
+    logging.info("🚀 Starting Bot...")
+    
+    # Initialize auto-upload manager
+    auto_upload_manager = AutoUploadManager()
+    bot.auto_upload_manager = auto_upload_manager
+    
+    # Register clean handler
+    register_clean_handler(bot)
+    
+    # Re-register auth commands
+    bot.add_handler(MessageHandler(auth.add_user_cmd, filters.command("add") & filters.private))
+    bot.add_handler(MessageHandler(auth.remove_user_cmd, filters.command("remove") & filters.private))
+    bot.add_handler(MessageHandler(auth.list_users_cmd, filters.command("users") & filters.private))
+    bot.add_handler(MessageHandler(auth.my_plan_cmd, filters.command("plan") & filters.private))
+    
     reset_and_set_commands()
     notify_owner()
+    
+    # Start the auto-upload scheduler (non-blocking)
+    if AUTO_UPLOAD_ENABLED:
+        # Start scheduler in background thread
+        auto_upload_manager.start_scheduler(bot)
+        logging.info(f"🔄 Auto-uploader started. Daily at {AUTO_UPLOAD_TIME}")
+        logging.info(f"📋 Batch IDs: {AUTO_UPLOAD_BATCH_IDS}")
+        logging.info(f"📤 Upload Channel: {AUTO_UPLOAD_CHANNEL}")
+    
+    # Run the bot (this will block main thread)
+    logging.info("🚀 Starting Pyrogram Client...")
     bot.run()
