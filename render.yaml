@@ -1,0 +1,36 @@
+services:
+  - type: worker
+    name: ugx-auto-uploader
+    env: python
+    buildCommand: |
+      apt-get update && apt-get install -y ffmpeg aria2
+      pip install -r thanosbots.txt
+    startCommand: python3 main.py
+    plan: standard
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: CREDIT
+        sync: false
+      - key: AUTO_UPLOAD_ENABLED
+        value: true
+      - key: AUTO_UPLOAD_TIME
+        value: "09:00"
+      - key: AUTO_UPLOAD_CHANNEL
+        value: "-1003692273087"
+      - key: AUTO_UPLOAD_BATCH_IDS
+        value: ""
+      - key: AUTO_UPLOAD_INTERVAL_HOURS
+        value: "24"
+      - key: LOG_CHANNEL_ID
+        sync: false
+      - key: API_BASE
+        value: "https://backend.multistreaming.site/api"
